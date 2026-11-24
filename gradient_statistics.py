@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 class CsvBuffer:
     """缓存单个通道的 CPU 明细；interval 表示几次采集写一个文件。"""
+
     def __init__(self, directory, channel, interval):
         self.directory = Path(directory)
         self.channel = channel
@@ -64,44 +65,28 @@ def distribution_columns(quantiles):
     return names
 
 
-def distribution(values, threshold, quantiles):
-    """在持有整层数据的 rank 上统计有限值，返回列名、浮点摘要和精确整数计数。
-
-    10 个桶按本步带符号的最小值、最大值等宽划分。计数额外保留 int64，
-    避免大层的元素数在 FP32 汇总中发生舍入。threshold 是绝对值近零阈值。
-    """
+def _empty_distribution(values, quantiles):
+    """空层保留列，计数填零，其余指标保持缺失。"""
     names = distribution_columns(quantiles)
-    if not values.numel():
-        return (
-            names,
-            values.new_tensor(
-                [0, 0]
-                + [math.nan] * 5
-                + [0] * 10
-                + ([math.nan] * 3 if quantiles else []),
-                dtype=torch.float32,
-            ),
-            torch.zeros(12, dtype=torch.int64, device=values.device),
-        )
-    finite = torch.isfinite(values)
-    count = finite.sum()
-    safe = torch.where(finite, values, 0.0)
-    norm = torch.linalg.vector_norm(safe)
-    minimum = torch.where(finite, values, math.inf).amin()
-    maximum = torch.where(finite, values, -math.inf).amax()
-    nan = values.new_tensor(math.nan)
-    lo = torch.where(count > 0, minimum, nan)
-    hi = torch.where(count > 0, maximum, nan)
+    return (
+        names,
+        values.new_tensor(
+            [0, 0] + [math.nan] * 5 + [0] * 10 + ([math.nan] * 3 if quantiles else []),
+            dtype=torch.float32,
+        ),
+        torch.zeros(12, dtype=torch.int64, device=values.device),
+    )
+
+
+def _histogram(values, finite, count, lo, hi, ordered):
+    """按整层范围切十桶；有序数组供桶计数和分位数共用。"""
     fractions = torch.arange(1, 10, device=values.device, dtype=torch.float32) / 10
     edges = torch.where(
         (lo < 0) & (hi > 0),
         lo * (1 - fractions) + hi * fractions,
         torch.lerp(lo, hi, fractions),
     )
-    if quantiles:
-        # 非有限值放在有序数组末尾。searchsorted 的左插入点给出严格小于
-        # 每条边界的数量，相邻累计数之差就是桶计数，末桶包含最大值。
-        ordered = torch.where(finite, values, math.inf).sort().values
+    if ordered is not None:
         cuts = torch.searchsorted(ordered, edges)
     else:
         cuts = torch.stack(
@@ -113,6 +98,42 @@ def distribution(values, threshold, quantiles):
     constant = torch.zeros_like(bins)
     constant[0] = count
     bins = torch.where(lo == hi, constant, bins)
+
+    return bins
+
+
+def _percentiles(ordered, count, nan):
+    # 排名只覆盖有限值所在的前缀。保留整数商和余数，最后再线性插值。
+    scaled = (count - 1).clamp_min(0) * count.new_tensor([50, 90, 99])
+    # 有限值若为 [-5, 1, 10]，p90 落在从 0 开始的第 1.8 位。
+    # 左右端点是 1 和 10，插值得 8.2。末尾为非有限值预留的位置不参与排名。
+    left = scaled // 100
+    right = (scaled + 99) // 100
+    q = torch.lerp(ordered[left], ordered[right], (scaled % 100).float() / 100)
+    return torch.where(count > 0, q, nan).unbind()
+
+
+def distribution(values, threshold, quantiles):
+    """在持有整层数据的 rank 上统计有限值，返回列名、浮点摘要和精确整数计数。
+
+    10 个桶按本步带符号的最小值、最大值等宽划分。计数额外保留 int64，
+    避免大层的元素数在 FP32 汇总中发生舍入。threshold 是绝对值近零阈值。
+    """
+    if not values.numel():
+        return _empty_distribution(values, quantiles)
+    # 找到有限元素，算范数、最小值和最大值。例如 [0, 2, NaN] 有两个有效元素，
+    # 近零比例的分母是 2；NaN 只记入非有限元素数。
+    finite = torch.isfinite(values)
+    count = finite.sum()
+    safe = torch.where(finite, values, 0.0)
+    norm = torch.linalg.vector_norm(safe)
+    minimum = torch.where(finite, values, math.inf).amin()
+    maximum = torch.where(finite, values, -math.inf).amax()
+    nan = values.new_tensor(math.nan)
+    lo = torch.where(count > 0, minimum, nan)
+    hi = torch.where(count > 0, maximum, nan)
+    ordered = torch.where(finite, values, math.inf).sort().values if quantiles else None
+    bins = _histogram(values, finite, count, lo, hi, ordered)
     result = [
         count,
         values.numel() - count,
@@ -124,16 +145,9 @@ def distribution(values, threshold, quantiles):
     ]
     result.extend(bins.unbind())
     if quantiles:
-        # 排名只覆盖有限值所在的前缀。保留整数商和余数，最后再线性插值。
-        scaled = (count - 1).clamp_min(0) * count.new_tensor([50, 90, 99])
-        # 有限值若为 [-5, 1, 10]，p90 落在从 0 开始的第 1.8 位。
-        # 左右端点是 1 和 10，插值得 8.2。末尾为非有限值预留的位置不参与排名。
-        left = scaled // 100
-        right = (scaled + 99) // 100
-        q = torch.lerp(ordered[left], ordered[right], (scaled % 100).float() / 100)
-        result.extend(torch.where(count > 0, q, nan).unbind())
+        result.extend(_percentiles(ordered, count, nan))
     return (
-        names,
+        distribution_columns(quantiles),
         torch.stack([x.float() for x in result]),
         torch.cat((count.view(1), (values.numel() - count).view(1), bins)),
     )
@@ -182,6 +196,8 @@ class LayerStatistics:
         layers 按各 rank 约定的顺序给出层名及本地参数段。分位数需要全层数据；
         cosine 只归约各分片的点积和平方和，历史快照始终按分片保存。
         """
+
+        # 先交换“每张卡持有本层多少个元素”。后面各卡用同一份长度表选出负责计算整层分布的卡。
         lengths = [sum(t.numel() for _, t in parts) for parts in layers.values()]
         sizes = self._sizes(lengths)
         dots, summaries, counts = [], [], []
@@ -192,49 +208,53 @@ class LayerStatistics:
                 else torch.empty(0, device=self.device)
             ).float()
             if cosine:
-                key = (kind, layer)
-                layout = tuple((name, t.numel()) for name, t in parts if t.numel())
-                # 即使两次扁平向量等长，参数也可能缺梯度或参与次序不同。
-                # 先核对名称和段长，避免对不对应的坐标计算方向相似度。
-                prior = self.history.get(key)
-                if prior is not None and layout == prior[0]:
-                    old = prior[1].float()
-                    dots.append(
-                        torch.stack(
-                            (
-                                old.dot(local),
-                                old.dot(old),
-                                local.dot(local),
-                                local.new_zeros(()),
-                            )
-                        )
-                    )
-                else:
-                    invalid = bool(layout or (prior and prior[0]))
-                    dots.append(local.new_tensor([0, 0, 0, int(invalid)]))
-                # local 来自本轮 cat，拥有独立存储；即使 to(dtype) 直接返回原张量，
-                # 下一次 zero_grad 或优化器原地修改 exp_avg，也不会改写这份历史。
-                # 以默认间隔为例，第 200 步先与 180 步比较，再留下供 220 步使用的快照。
-                dtype = (
-                    parts[0][1].dtype
-                    if parts and all(t.dtype == parts[0][1].dtype for _, t in parts)
-                    else torch.float32
-                )
-                self.history[key] = (layout, local.to(dtype))
+                dots.append(self._cosine_terms((kind, layer), parts, local))
             chunks = [row[i] for row in sizes]
-            owner = chunks.index(max(chunks))
-            full = self._gather(local, chunks, owner)
-            if self.rank == owner:
-                names, stats, integers = distribution(full, self.threshold, cosine)
-                summaries.append(stats)
-                counts.append(integers)
-            else:
-                summaries.append(local.new_zeros(20 if cosine else 17))
-                counts.append(local.new_zeros(12, dtype=torch.int64))
-            del full
+            summary, integers = self._layer_distribution(local, chunks, cosine)
+            summaries.append(summary)
+            counts.append(integers)
         if not layers:
             return []
-        if cosine:
+        return self._reduce_records(step, kind, layers, summaries, counts, dots)
+
+    def _cosine_terms(self, key, parts, local):
+        """先比较同一布局的历史分片，再保存本地快照给下一采集步。"""
+        layout = tuple((name, t.numel()) for name, t in parts if t.numel())
+        # 即使两次扁平向量等长，参数也可能缺梯度或参与次序不同。
+        # 先核对名称和段长，避免对不对应的坐标计算方向相似度。
+        prior = self.history.get(key)
+        if prior is not None and layout == prior[0]:
+            old = prior[1].float()
+            terms = torch.stack(
+                (old.dot(local), old.dot(old), local.dot(local), local.new_zeros(()))
+            )
+        else:
+            invalid = bool(layout or (prior and prior[0]))
+            terms = local.new_tensor([0, 0, 0, int(invalid)])
+        # local 来自本轮 cat，拥有独立存储；即使 to(dtype) 直接返回原张量，
+        # 下一次 zero_grad 或优化器原地修改 exp_avg，也不会改写这份历史。
+        # 以默认间隔为例，第 200 步先与 180 步比较，再留下供 220 步使用的快照。
+        dtype = (
+            parts[0][1].dtype
+            if parts and all(t.dtype == parts[0][1].dtype for _, t in parts)
+            else torch.float32
+        )
+        self.history[key] = (layout, local.to(dtype))
+        return terms
+
+    def _layer_distribution(self, local, chunks, quantiles):
+        """只在拥有最大分片的 rank 做整层分布；其他 rank 提供零摘要。"""
+        owner = chunks.index(max(chunks))
+        full = self._gather(local, chunks, owner)
+        if self.rank == owner:
+            _, summary, integers = distribution(full, self.threshold, quantiles)
+            return summary, integers
+        return local.new_zeros(20 if quantiles else 17), local.new_zeros(
+            12, dtype=torch.int64
+        )
+
+    def _reduce_records(self, step, kind, layers, summaries, counts, dots):
+        if dots:
             packed = torch.stack(dots)
             if self.world > 1:
                 dist.all_reduce(packed, group=self.group)
@@ -247,8 +267,8 @@ class LayerStatistics:
             dist.all_reduce(integer_counts, group=self.group)
         if self.rank != 0:
             return []
-        names = distribution_columns(cosine)
-        if cosine:
+        names = distribution_columns(bool(dots))
+        if dots:
             dot, old_sq, new_sq, invalid = packed.unbind(1)
             denom = old_sq.sqrt() * new_sq.sqrt()
             similarity = torch.where(
@@ -256,6 +276,10 @@ class LayerStatistics:
             )
             output = torch.cat((output, similarity[:, None]), dim=1)
             names = names + ["cosine"]
+        return self._format_records(step, kind, layers, names, output, integer_counts)
+
+    @staticmethod
+    def _format_records(step, kind, layers, names, output, integer_counts):
         records = []
         count_keys = ["finite_numel", "nonfinite_numel"] + [
             f"bin_{i}_count" for i in range(10)

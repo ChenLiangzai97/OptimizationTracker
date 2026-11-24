@@ -1,6 +1,6 @@
 # OptimizationTracker
 
-当前版本 **v1.0.2** · [实验文档](docs/experiments/optimization-tracker/README.md) · [代码设计与版本记录](docs/experiments/optimization-tracker/code/README.md)
+当前版本 **v1.1.0** · [实验文档](docs/experiments/optimization-tracker/README.md) · [代码设计与版本记录](docs/experiments/optimization-tracker/code/README.md)
 
 在 optimizer step 20、40、60…采集梯度和 Adam 状态，每 200 步追加更新后的参数统计。重步的轻通道只执行一次。普通步跳过本组件的张量运算和通信。
 
@@ -37,14 +37,16 @@ rank 0 用 UTF-8 BOM 写入 `light_layer_stats_step_<末步>.csv` 和 `heavy_lay
 - 范数、RMS、最值、p50/p90/p99、直方图使用有限元素。记录有限及非有限数量，非有限值单独标记。近零比例按绝对值严格小于阈值计算。空集合指标留空。CSV 分桶及分位数使用带符号的数值。
 - 每层每步用全局 min/max 等宽分 10 桶，左闭右开，末桶包含最大值。常量层放入首桶。桶计数为整数。分位数对全量 FP32 统计值排序并线性插值，复用排序结果进行 CDF 分桶。参数通道只做阈值计数，无需排序。
 - cosine 比较相邻两次轻通道，按本地分片保存全部元素，快照保留源张量精度（混合精度层统一用 FP32），点积和范数用 FP32。首次采集、参与的参数段变化、零范数或存在非有限值时留空。重启后的首个统计步重新建立快照。
-- 完整模块的更新前参数范数作为相对更新量分母，更新向量按参数组学习率和更新后的 Adam 一二阶矩推算。支持标准 Adam/AdamW 的 epsilon 放置、偏差修正和 AMSGrad。假设 weight decay 为零。未收到梯度的已注册参数贡献零更新，缺失所需优化器状态或更新前范数为零时相应字段留空。CSV 的推算量是优化器算术更新；低精度权重写回舍入会影响实测差值。自定义 BF16AdamW 需核实其 state 字段和更新规则。
+- `update` 行新增 `weight_decay_update_norm`、`gradient_update_norm` 和 `wd_ratio`。对于 AdamW，三项分别表示解耦衰减步长范数、含学习率与偏差修正的 Adam 自适应步长范数，以及前者除以后者。各参数组分别应用本步超参数，再按层跨分片合并平方和。总更新范数取两向量相加后的范数，低精度权重写回舍入可能使实际差分略有不同。
+- 自适应步长为零时比值留空；无梯度的已注册参数贡献零更新，仍计入整层旧权重范数。标准 Adam 的非零耦合 L2 可还原总步长，分项和比值留空。对于自定义优化器，确认更新公式与标准 AdamW 一致后，可在参数组注明 `decoupled_weight_decay=True`；未知非零衰减规则或缺少必要状态时更新字段留空。
+- TB 标签 `GradientHealth/optimizer/wd_ratio` 汇总全部受监控参数，用两个全局范数相除。任一参与段无法分解或全局分母为零时跳过该点。每层比值可在轻通道 CSV 查看。
 - 历史 TB 的 opt_delta_w_rms 沿用原先未做偏差修正的自适应项；CSV 使用上述更新口径。CSV 记录每层，TB 延续原有主组聚合。
 
 ## 分片与开销
 
 DDP 仅 rank 0 运行新增 CSV 采集。FSDP 在 shard group 内合并，全层位于单卡时就地统计。跨卡层由持有最多元素的 rank 临时收齐该层当前对象的分片。各层的结果打包归约，原始梯度和状态不传到 CPU。该路径依赖后端支持不等长、含零长度分片的 all_to_all_single。HSDP 使用 shard group，FSDP2 支持一个分片维度及复制维度。各 rank 需要一致的模块名称及顺序。FSDP1 支持原参数及能通过现有 handle 元数据关联的 flat optimizer state。
 
-显存预算包含完整 g/m/v 本地历史、单层 gather 和排序工作区，以及已有 TB Hook 保留的梯度快照。在三个对象均为 FP32 的情况下，CSV 历史每个本地元素约 12 字节。实际设备峰值还受最大单层和 allocator 影响。
+显存预算包含完整 g/m/v 本地历史、单层 gather 和排序工作区，以及已有 TB Hook 保留的梯度快照。在三个对象均为 FP32 的情况下，CSV 历史每个本地元素约 12 字节。非零解耦衰减且有梯度的本地分片在采集步短暂保留一份旧权重，精度同源权重。实际设备峰值还受最大单层和 allocator 影响。
 
 ## 验证
 

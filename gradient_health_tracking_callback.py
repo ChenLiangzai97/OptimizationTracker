@@ -217,7 +217,8 @@ class GradientHealthTrackingCallback(GradientHealthMonitorCallback):
                     math.sqrt(row[i] / n) if n else 0.0,
                     step,
                 )
-        tb(f"{prefix}/wd_ratio", 0.0, step)
+        if self.tracker.last_wd_ratio is not None:
+            tb(f"{prefix}/wd_ratio", self.tracker.last_wd_ratio, step)
 
     def on_train_end(self, args, state, control, **kwargs):
         try:
