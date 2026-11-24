@@ -17,7 +17,8 @@ def report_fallback(monitor, tracker, gradients, step, tb, logger):
             seen.add(name)
             if tensor.numel():
                 groups[gids[name]].append(tensor.reshape(-1))
-    # Local elements, nonfinite, 13 old log bins, near zero, extreme.
+    # 每行对应一个旧 TB 主组。前两列是扫描数和非有限数；重步再追加
+    # 13 个绝对值对数桶、近零数、极值数。元素计数在跨卡求和前保持 int64。
     counts = torch.zeros(
         (group_count, 17 if heavy else 2), device=device, dtype=torch.int64
     )
@@ -39,6 +40,8 @@ def report_fallback(monitor, tracker, gradients, step, tb, logger):
             counts[i, 2:15] = torch.diff(
                 torch.cat((cdf.new_zeros(1), cdf, counts[i, :1]))
             )
+            # 求范数时已把 NaN/Inf 置零，它们也因此进入首桶。扣掉这部分，
+            # 让直方图计数和旧监控器传给 _attach_heavy 的有限元素分母一致。
             counts[i, 2] -= counts[i, 1]
             counts[i, 15] = (finite & (absolute < monitor._near_zero)).sum()
             counts[i, 16] = (finite & (absolute > monitor._extreme)).sum()

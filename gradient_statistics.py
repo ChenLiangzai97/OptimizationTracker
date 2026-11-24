@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 
 class CsvBuffer:
+    """缓存单个通道的 CPU 明细；interval 表示几次采集写一个文件。"""
     def __init__(self, directory, channel, interval):
         self.directory = Path(directory)
         self.channel = channel
@@ -18,12 +19,14 @@ class CsvBuffer:
         self.steps = 0
 
     def add(self, records):
+        """一次调用对应一个统计步，每条明细保留其原始步号。"""
         self.pending.extend(records)
         self.steps += 1
         if self.steps >= self.interval:
             self.flush()
 
     def flush(self):
+        """按缓存末步命名文件。原子替换成功后才清空缓存，写入失败时可重试。"""
         if self.pending:
             self.directory.mkdir(parents=True, exist_ok=True)
             last = self.pending[-1]["step"]
@@ -40,6 +43,7 @@ class CsvBuffer:
 
 
 def local_tensor(tensor):
+    """取脱离计算图的本地视图；DTensor 在此只暴露本 rank 的分片。"""
     if hasattr(tensor, "to_local"):
         return tensor.to_local().detach()
     return tensor.detach()
@@ -61,7 +65,11 @@ def distribution_columns(quantiles):
 
 
 def distribution(values, threshold, quantiles):
-    """Signed finite-value statistics. Reuse the full sort for CDF counts."""
+    """在持有整层数据的 rank 上统计有限值，返回列名、浮点摘要和精确整数计数。
+
+    10 个桶按本步带符号的最小值、最大值等宽划分。计数额外保留 int64，
+    避免大层的元素数在 FP32 汇总中发生舍入。threshold 是绝对值近零阈值。
+    """
     names = distribution_columns(quantiles)
     if not values.numel():
         return (
@@ -91,6 +99,8 @@ def distribution(values, threshold, quantiles):
         torch.lerp(lo, hi, fractions),
     )
     if quantiles:
+        # 非有限值放在有序数组末尾。searchsorted 的左插入点给出严格小于
+        # 每条边界的数量，相邻累计数之差就是桶计数，末桶包含最大值。
         ordered = torch.where(finite, values, math.inf).sort().values
         cuts = torch.searchsorted(ordered, edges)
     else:
@@ -99,7 +109,7 @@ def distribution(values, threshold, quantiles):
         )
     cuts = torch.where(count == 0, 0, cuts)
     bins = torch.diff(torch.cat([count.new_zeros(1), cuts, count.view(1)]))
-    # Constant layers are stored entirely in bin 0.
+    # 常量层的九条边界完全重合，统一把有限元素放在首桶，便于从 CSV 识别这种退化分布。
     constant = torch.zeros_like(bins)
     constant[0] = count
     bins = torch.where(lo == hi, constant, bins)
@@ -114,7 +124,10 @@ def distribution(values, threshold, quantiles):
     ]
     result.extend(bins.unbind())
     if quantiles:
+        # 排名只覆盖有限值所在的前缀。保留整数商和余数，最后再线性插值。
         scaled = (count - 1).clamp_min(0) * count.new_tensor([50, 90, 99])
+        # 有限值若为 [-5, 1, 10]，p90 落在从 0 开始的第 1.8 位。
+        # 左右端点是 1 和 10，插值得 8.2。末尾为非有限值预留的位置不参与排名。
         left = scaled // 100
         right = (scaled + 99) // 100
         q = torch.lerp(ordered[left], ordered[right], (scaled % 100).float() / 100)
@@ -145,12 +158,16 @@ class LayerStatistics:
             self.world * len(lengths), device=self.device, dtype=own.dtype
         )
         dist.all_gather_into_tensor(sizes, own, group=self.group)
+        # 同步取回的是 rank × 层的长度表；后面的变长通信需要主机侧 split sizes。
         return sizes.view(self.world, -1).tolist()
 
     def _gather(self, local, sizes, owner):
         if sum(sizes) == sizes[owner]:
             return local
-        # Keep the largest shard in place. Only split layers need a collective.
+        # owner 是分片最大的 rank。每个 rank 只向它发送本地段，其他 rank
+        # 的接收长度全为 0；临时接收缓冲只需容纳当前层的这一种统计对象。
+        # 例：rank 0/1 分别持有 2/5 个元素，owner=1。两卡的 send 分别是
+        # [0, 2]、[0, 5]；rank 1 的 recv=[2, 5]，得到完整 7 个值后才能排全局分位数。
         recv = sizes if self.rank == owner else [0] * self.world
         send = [0] * self.world
         send[owner] = local.numel()
@@ -160,7 +177,11 @@ class LayerStatistics:
 
     @torch.no_grad()
     def collect(self, step, kind, layers, cosine=True):
-        """layers maps a module path to ordered (parameter name, local tensor) pairs."""
+        """采集一个 step、一个对象类型的逐层统计，返回本进程组 rank 0 的明细。
+
+        layers 按各 rank 约定的顺序给出层名及本地参数段。分位数需要全层数据；
+        cosine 只归约各分片的点积和平方和，历史快照始终按分片保存。
+        """
         lengths = [sum(t.numel() for _, t in parts) for parts in layers.values()]
         sizes = self._sizes(lengths)
         dots, summaries, counts = [], [], []
@@ -173,6 +194,8 @@ class LayerStatistics:
             if cosine:
                 key = (kind, layer)
                 layout = tuple((name, t.numel()) for name, t in parts if t.numel())
+                # 即使两次扁平向量等长，参数也可能缺梯度或参与次序不同。
+                # 先核对名称和段长，避免对不对应的坐标计算方向相似度。
                 prior = self.history.get(key)
                 if prior is not None and layout == prior[0]:
                     old = prior[1].float()
@@ -189,7 +212,9 @@ class LayerStatistics:
                 else:
                     invalid = bool(layout or (prior and prior[0]))
                     dots.append(local.new_tensor([0, 0, 0, int(invalid)]))
-                # cat owns its storage, independent of zero_grad/optimizer in-place writes.
+                # local 来自本轮 cat，拥有独立存储；即使 to(dtype) 直接返回原张量，
+                # 下一次 zero_grad 或优化器原地修改 exp_avg，也不会改写这份历史。
+                # 以默认间隔为例，第 200 步先与 180 步比较，再留下供 220 步使用的快照。
                 dtype = (
                     parts[0][1].dtype
                     if parts and all(t.dtype == parts[0][1].dtype for _, t in parts)
@@ -216,7 +241,8 @@ class LayerStatistics:
         output = torch.stack(summaries)
         integer_counts = torch.stack(counts)
         if self.world > 1:
-            # Exactly one rank populated each row. Move only layer summaries.
+            # 每一层只有 owner 填写真实统计行，其他 rank 填零。例如本层 owner=1，
+            # 求和会把 rank 1 的整行传到输出端；此处传输的数据量仅取决于层数和列数。
             dist.all_reduce(output, group=self.group)
             dist.all_reduce(integer_counts, group=self.group)
         if self.rank != 0:
@@ -234,6 +260,7 @@ class LayerStatistics:
         count_keys = ["finite_numel", "nonfinite_numel"] + [
             f"bin_{i}_count" for i in range(10)
         ]
+        # 到这里才把整批逐层摘要搬回主机；整数桶计数覆盖浮点摘要中的计数列。
         for layer, values, ints in zip(
             layers, output.tolist(), integer_counts.tolist()
         ):

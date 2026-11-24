@@ -1,5 +1,7 @@
 # OptimizationTracker
 
+当前版本 **v1.0.2** · [实验文档](docs/experiments/optimization-tracker/README.md) · [代码设计与版本记录](docs/experiments/optimization-tracker/code/README.md)
+
 在 optimizer step 20、40、60…采集梯度和 Adam 状态，每 200 步追加更新后的参数统计。重步的轻通道只执行一次。普通步跳过本组件的张量运算和通信。
 
 ## 接入训练仓

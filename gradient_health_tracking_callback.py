@@ -16,6 +16,13 @@ from .optimizer_tracker import OptimizationTracker
 
 
 class GradientHealthTrackingCallback(GradientHealthMonitorCallback):
+    """将同一个 optimizer 步号 cur_it 贯穿训练回调。
+
+    以第 200 步为例：FSDP1 在 backward 前开启旧 TB Hook，backward 后启动归约。
+    pre-optimizer 回调读取已同步的梯度，缓存各层更新前的权重平方和。
+    optimizer-step 回调收取 TB 结果，读取更新后的矩状态，并追加一次参数分布。
+    fallback 在 pre-optimizer 复用 CSV 采集到的梯度视图来构建旧 TB 记录。
+    """
     def __init__(self):
         super().__init__()
         self.tracker = None
@@ -54,6 +61,8 @@ class GradientHealthTrackingCallback(GradientHealthMonitorCallback):
                             info.numel_in_shard or 0,
                         )
         elif strategy == "fsdp2":
+            # 只在切分参数的 mesh 维度上汇总。复制维度上各卡持有相同元素，
+            # 交给统计器按 replica_names 去重，避免放大计数和平方和。
             from torch.distributed.tensor import Shard
 
             for name, p in monitor.monitored_params.items():
@@ -80,6 +89,7 @@ class GradientHealthTrackingCallback(GradientHealthMonitorCallback):
                     raise ValueError(
                         "Multiple sharding dimensions need an explicit statistics group"
                     )
+        # DDP 梯度已同步，仅写入端需要新增 CSV 扫描；分片路径需各 rank 参与通信。
         if not sharded and self.rank != 0:
             return
         if sharded and not dist.is_initialized():
@@ -121,6 +131,7 @@ class GradientHealthTrackingCallback(GradientHealthMonitorCallback):
             self._monitor is not None
             and self._monitor.mode == GradientHealthMonitor.MODE_HOOK
         ):
+            # RS patch 在整个训练期都已挂载；普通步要清掉上次统计步的激活位。
             self._monitor._hook._step_active = False
 
     def on_post_backward(self, args, state, control, **kwargs):
@@ -156,6 +167,7 @@ class GradientHealthTrackingCallback(GradientHealthMonitorCallback):
             monitor = self._monitor
             step = kwargs["cur_it"]
             if monitor.mode == monitor.MODE_HOOK:
+                # 在权重更新后消费 backward 结束时发起的旧 TB 异步归约。
                 monitor.post_optimizer(
                     step, self._tb_logger.add_scalar, self._str_logger
                 )
